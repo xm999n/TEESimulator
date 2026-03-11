@@ -1,3 +1,4 @@
+-dontobfuscate
 -keep class org.matrix.TEESimulator.interception.keystore.** { *; }
 
 -keep class org.bouncycastle.jcajce.provider.** { *; }
