@@ -10,6 +10,7 @@ import android.system.keystore2.KeyDescriptor
 import android.system.keystore2.KeyEntryResponse
 import java.security.SecureRandom
 import java.security.cert.Certificate
+import java.util.concurrent.atomic.AtomicInteger
 import org.matrix.TEESimulator.attestation.AttestationPatcher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.config.ConfigurationManager
@@ -262,8 +263,11 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                     KeyMintSecurityLevelInterceptor.generatedKeys[keyId] =
                         KeyMintSecurityLevelInterceptor.GeneratedKeyInfo(
                             keyData.first,
+                            null,
                             key.nspace,
                             response,
+                            parsedParameters,
+                            parsedParameters.usageCountLimit?.let(::AtomicInteger),
                         )
                     KeyMintSecurityLevelInterceptor.attestationKeys.add(keyId)
                     return InterceptorUtils.createTypedObjectReply(response)

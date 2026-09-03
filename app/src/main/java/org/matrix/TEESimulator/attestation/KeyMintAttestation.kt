@@ -26,7 +26,11 @@ data class KeyMintAttestation(
     val padding: List<Int>,
     val purpose: List<Int>,
     val digest: List<Int>,
+    // AOSP: [key_param(tag = RSA_OAEP_MGF_DIGEST, field = Digest)] (repeated)
+    val rsaOaepMgfDigest: List<Int>,
     val rsaPublicExponent: BigInteger?,
+    val usageCountLimit: Int?,
+    val callerNonce: ByteArray?,
     val certificateSerial: BigInteger?,
     val certificateSubject: X500Name?,
     val certificateNotBefore: Date?,
@@ -75,8 +79,17 @@ data class KeyMintAttestation(
         // AOSP: [key_param(tag = DIGEST, field = Digest)]
         digest = params.findAllDigests(Tag.DIGEST),
 
+        // AOSP: [key_param(tag = RSA_OAEP_MGF_DIGEST, field = Digest)] (repeated)
+        rsaOaepMgfDigest = params.findAllDigests(Tag.RSA_OAEP_MGF_DIGEST),
+
         // AOSP: [key_param(tag = RSA_PUBLIC_EXPONENT, field = LongInteger)]
         rsaPublicExponent = params.findLongInteger(Tag.RSA_PUBLIC_EXPONENT),
+
+        // AOSP: [key_param(tag = USAGE_COUNT_LIMIT, field = Integer)]
+        usageCountLimit = params.findInteger(Tag.USAGE_COUNT_LIMIT),
+
+        // AOSP: [key_param(tag = NONCE, field = Blob)] — caller-provided IV for operations.
+        callerNonce = params.findBlob(Tag.NONCE),
 
         // AOSP: [key_param(tag = CERTIFICATE_SERIAL, field = Blob)]
         certificateSerial = params.findBlob(Tag.CERTIFICATE_SERIAL)?.let { BigInteger(it) },
@@ -112,6 +125,17 @@ data class KeyMintAttestation(
     fun isAttestKey(): Boolean {
         return purpose.size == 1 && purpose.contains(KeyPurpose.ATTEST_KEY)
     }
+
+    /**
+     * Returns a copy with the KeyMint default MGF digest (SHA-1) applied to RSA-OAEP keys that did
+     * not request an explicit set. KeyMint 3+ reports this default through key characteristics.
+     */
+    fun withOaepMgfDefaults(): KeyMintAttestation =
+        if (padding.contains(PaddingMode.RSA_OAEP) && rsaOaepMgfDigest.isEmpty()) {
+            copy(rsaOaepMgfDigest = listOf(Digest.SHA1))
+        } else {
+            this
+        }
 
     fun isImportKey(): Boolean {
         return origin == KeyOrigin.IMPORTED || origin == KeyOrigin.SECURELY_IMPORTED

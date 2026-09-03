@@ -411,7 +411,10 @@ private data class LegacyKeygenParameters(
             padding = listOf<Int>(),
             purpose = this.purpose,
             digest = this.digest,
+            rsaOaepMgfDigest = emptyList(),
             rsaPublicExponent = this.rsaPublicExponent,
+            usageCountLimit = null,
+            callerNonce = null,
             certificateSerial = null, // Not provided in legacy generateKey
             certificateSubject = null, // Not provided in legacy generateKey
             certificateNotBefore = this.certificateNotBefore,

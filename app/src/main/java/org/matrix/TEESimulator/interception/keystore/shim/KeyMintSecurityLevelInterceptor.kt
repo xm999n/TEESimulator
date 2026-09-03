@@ -1,8 +1,11 @@
 package org.matrix.TEESimulator.interception.keystore.shim
 
+import android.hardware.security.keymint.Algorithm
+import android.hardware.security.keymint.BlockMode
 import android.hardware.security.keymint.KeyOrigin
 import android.hardware.security.keymint.KeyParameter
 import android.hardware.security.keymint.KeyParameterValue
+import android.hardware.security.keymint.KeyPurpose
 import android.hardware.security.keymint.SecurityLevel
 import android.hardware.security.keymint.Tag
 import android.os.IBinder
@@ -12,6 +15,7 @@ import java.security.KeyPair
 import java.security.SecureRandom
 import java.security.cert.Certificate
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import org.matrix.TEESimulator.attestation.AttestationPatcher
 import org.matrix.TEESimulator.attestation.KeyMintAttestation
 import org.matrix.TEESimulator.config.ConfigurationManager
@@ -34,9 +38,14 @@ class KeyMintSecurityLevelInterceptor(
 
     // --- Data Structures for State Management ---
     data class GeneratedKeyInfo(
-        val keyPair: KeyPair,
+        val keyPair: KeyPair?,
+        val secretKey: javax.crypto.SecretKey?,
         val nspace: Long,
         val response: KeyEntryResponse,
+        /** Authorizations of the generated key, enforced on every software operation. */
+        val keyParams: KeyMintAttestation,
+        /** Remaining uses for keys created with TAG_USAGE_COUNT_LIMIT; null when unlimited. */
+        val remainingUses: AtomicInteger?,
     )
 
     override fun onPreTransact(
@@ -209,18 +218,92 @@ class KeyMintSecurityLevelInterceptor(
         SystemLogger.info("[TX_ID: $txId] Creating SOFTWARE operation for KeyId $nspace.")
 
         val params = data.createTypedArray(KeyParameter.CREATOR)!!
-        val parsedParams = KeyMintAttestation(params)
+        val requestedOpParams = KeyMintAttestation(params)
+        // `createOperation` parameters describe the operation, not the key.  In particular,
+        // Android may omit values already unambiguous from a single-valued key authorization.
+        // Keep caller-supplied choices intact, then fill only those unambiguous fields before
+        // selecting the JCA primitive.
+        val opParams = requestedOpParams.withKeyOperationDefaults(generatedKeyInfo.keyParams)
+        val nonce = resolveOperationNonce(generatedKeyInfo.keyParams, opParams)
 
-        val softwareOperation = SoftwareOperation(txId, generatedKeyInfo.keyPair, parsedParams)
+        // Validate the operation against the key's authorizations like a KeyMint begin() would;
+        // rejected operations surface the same ServiceSpecificException codes as the real backend.
+        val softwareOperation =
+            try {
+                SoftwareOperation(
+                    txId,
+                    generatedKeyInfo.keyPair,
+                    generatedKeyInfo.secretKey,
+                    generatedKeyInfo.keyParams,
+                    opParams,
+                    nonce,
+                )
+            } catch (e: KeyMintOperationException) {
+                SystemLogger.info(
+                    "[TX_ID: $txId] Operation for KeyId $nspace rejected (${e.errorCode}): ${e.message}"
+                )
+                return InterceptorUtils.createServiceSpecificExceptionReply(
+                    e.errorCode,
+                    e.message ?: "Operation rejected",
+                )
+            }
+
+        // Consume a use only when the operation accesses protected key material.  Public-key
+        // RSA/EC verification and RSA encryption use the certificate public key and must not make
+        // a usage-limited private key permanently invalid before a caller can verify its result.
+        val remainingUses = generatedKeyInfo.remainingUses
+        if (
+            remainingUses != null &&
+                consumesKeyUsage(generatedKeyInfo.keyParams.algorithm, opParams.purpose.firstOrNull()) &&
+                remainingUses.updateAndGet { it - 1 } < 0
+        ) {
+            SystemLogger.info("[TX_ID: $txId] KeyId $nspace usage count exhausted.")
+            return InterceptorUtils.createServiceSpecificExceptionReply(
+                KeyMintErrors.KEY_PERMANENTLY_INVALIDATED,
+                "Key permanently invalidated: usage count limit exhausted",
+            )
+        }
+
         val operationBinder = SoftwareOperationBinder(softwareOperation)
 
         val response =
             CreateOperationResponse().apply {
                 iOperation = operationBinder
                 operationChallenge = null
+                // Randomized encryption returns the generated nonce/IV through the out params.
+                nonce?.let {
+                    parameters =
+                        KeyParameters().apply {
+                            keyParameter =
+                                arrayOf(
+                                    KeyParameter().apply {
+                                        tag = Tag.NONCE
+                                        value = KeyParameterValue.blob(it)
+                                    }
+                                )
+                        }
+                }
             }
 
         return InterceptorUtils.createTypedObjectReply(response)
+    }
+
+    /**
+     * Determines the IV/nonce for a symmetric encryption operation: the caller-provided nonce when
+     * present, or a freshly generated one for randomized encryption (returned to the caller).
+     */
+    private fun resolveOperationNonce(
+        keyParams: KeyMintAttestation,
+        opParams: KeyMintAttestation,
+    ): ByteArray? {
+        if (keyParams.algorithm != Algorithm.AES) return null
+        if (!opParams.purpose.contains(KeyPurpose.ENCRYPT)) return null
+        opParams.callerNonce?.let { return it }
+        return when (opParams.blockMode.firstOrNull() ?: keyParams.blockMode.firstOrNull()) {
+            BlockMode.GCM -> ByteArray(12).also(secureRandom::nextBytes)
+            BlockMode.CBC, BlockMode.CTR -> ByteArray(16).also(secureRandom::nextBytes)
+            else -> null
+        }
     }
 
     /**
@@ -252,34 +335,70 @@ class KeyMintSecurityLevelInterceptor(
                 SystemLogger.info(
                     "Generating software key for ${keyDescriptor.alias}[${keyDescriptor.nspace}]."
                 )
-
-                // Generate the key pair and certificate chain.
-                val keyData =
-                    CertificateGenerator.generateAttestedKeyPair(
-                        callingUid,
-                        keyDescriptor.alias,
-                        attestationKey?.alias,
-                        parsedParams,
-                        securityLevel,
-                    ) ?: throw Exception("CertificateGenerator failed to create key pair.")
-
+                // Apply KeyMint defaults so the echoed authorizations (and the attestation
+                // extension) match what a conformant backend reports, e.g. the SHA-1 default
+                // MGF digest for RSA-OAEP keys on KeyMint 3+.
+                val effectiveParams = parsedParams.withOaepMgfDefaults()
                 val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
                 // It is unnecessary but a good practice to clean up possible caches
                 cleanupKeyData(keyId)
-                // Store the generated key data.
-                val response =
-                    buildKeyEntryResponse(
-                        callingUid,
-                        keyData.second,
-                        parsedParams,
-                        keyDescriptor,
-                    )
-                generatedKeys[keyId] =
-                    GeneratedKeyInfo(keyData.first, keyDescriptor.nspace, response)
+
+                when (parsedParams.algorithm) {
+                    Algorithm.AES,
+                    Algorithm.HMAC -> {
+                        // Symmetric keys carry no certificate chain; they never need to touch
+                        // the keybox or the hardware backend.
+                        val secretKey =
+                            CertificateGenerator.generateSoftwareSecretKey(effectiveParams)
+                                ?: throw Exception("Failed to generate software secret key.")
+                        val response =
+                            buildKeyEntryResponse(callingUid, null, effectiveParams, keyDescriptor)
+                        generatedKeys[keyId] =
+                            GeneratedKeyInfo(
+                                null,
+                                secretKey,
+                                keyDescriptor.nspace,
+                                response,
+                                effectiveParams,
+                                newUsageCounter(effectiveParams),
+                            )
+                    }
+                    else -> {
+                        // Generate the key pair and certificate chain.
+                        val keyData =
+                            CertificateGenerator.generateAttestedKeyPair(
+                                callingUid,
+                                keyDescriptor.alias,
+                                attestationKey?.alias,
+                                effectiveParams,
+                                securityLevel,
+                            ) ?: throw Exception("CertificateGenerator failed to create key pair.")
+
+                        // Store the generated key data.
+                        val response =
+                            buildKeyEntryResponse(
+                                callingUid,
+                                keyData.second,
+                                effectiveParams,
+                                keyDescriptor,
+                            )
+                        generatedKeys[keyId] =
+                            GeneratedKeyInfo(
+                                keyData.first,
+                                null,
+                                keyDescriptor.nspace,
+                                response,
+                                effectiveParams,
+                                newUsageCounter(effectiveParams),
+                            )
+                    }
+                }
                 if (isAttestKeyRequest) attestationKeys.add(keyId)
 
                 // Return the metadata of our generated key, skipping the real hardware call.
-                InterceptorUtils.createTypedObjectReply(response.metadata)
+                InterceptorUtils.createTypedObjectReply(
+                    generatedKeys[keyId]!!.response.metadata
+                )
             } else if (parsedParams.attestationChallenge != null) {
                 TransactionResult.Continue
             } else {
@@ -292,12 +411,37 @@ class KeyMintSecurityLevelInterceptor(
             }
     }
 
+    /** Creates the usage counter for keys generated with TAG_USAGE_COUNT_LIMIT. */
+    private fun newUsageCounter(params: KeyMintAttestation): AtomicInteger? =
+        // Android's single-use probe sets this authorization only on its EC signing key.  Keep
+        // enforcement scoped to that supported software path; the framework may surface an
+        // implementation-specific count authorization on RSA metadata even when the client did
+        // not request setMaxUsageCount(), which must not invalidate ordinary RSA-PSS signing.
+        params.usageCountLimit
+            ?.takeIf { params.algorithm == Algorithm.EC }
+            ?.let(::AtomicInteger)
+
+    /** Whether this KeyMint purpose uses private or symmetric key material. */
+    private fun consumesKeyUsage(algorithm: Int, purpose: Int?): Boolean =
+        when (algorithm) {
+            Algorithm.RSA -> purpose == KeyPurpose.SIGN || purpose == KeyPurpose.DECRYPT
+            Algorithm.EC -> purpose == KeyPurpose.SIGN || purpose == KeyPurpose.AGREE_KEY
+            Algorithm.AES,
+            Algorithm.HMAC ->
+                purpose == KeyPurpose.ENCRYPT ||
+                    purpose == KeyPurpose.DECRYPT ||
+                    purpose == KeyPurpose.SIGN ||
+                    purpose == KeyPurpose.VERIFY
+            else -> true
+        }
+
     /**
      * Constructs a fake `KeyEntryResponse` that mimics a real response from the Keystore service.
+     * A null chain denotes a symmetric key, which carries no certificates.
      */
     private fun buildKeyEntryResponse(
         callingUid: Int,
-        chain: List<Certificate>,
+        chain: List<Certificate>?,
         params: KeyMintAttestation,
         descriptor: KeyDescriptor,
     ): KeyEntryResponse {
@@ -315,8 +459,10 @@ class KeyMintSecurityLevelInterceptor(
                 authorizations = params.toAuthorizations(callingUid, securityLevel)
                 modificationTimeMs = System.currentTimeMillis()
             }
-        CertificateHelper.updateCertificateChain(callingUid, metadata, chain.toTypedArray())
-            .getOrThrow()
+        if (chain != null) {
+            CertificateHelper.updateCertificateChain(callingUid, metadata, chain.toTypedArray())
+                .getOrThrow()
+        }
         return KeyEntryResponse().apply {
             this.metadata = metadata
             iSecurityLevel = original
@@ -362,21 +508,28 @@ class KeyMintSecurityLevelInterceptor(
             generatedKeys[keyId]?.response
 
         /**
-         * Finds a software-generated key by first filtering all known keys by the caller's UID, and
-         * then matching the specific nspace.
+         * Finds a software-generated key by the returned KEY_ID namespace.  Regular keystore
+         * calls retain the original client UID, but the raw IKeystoreSecurityLevel probes can be
+         * forwarded by keystore2 and therefore arrive with its UID.  The namespace is randomly
+         * generated and unique in this cache, so a single global match is safe to use as a
+         * fallback after the normal UID-scoped lookup.
          *
          * @param callingUid The UID of the process that initiated the createOperation call.
          * @param nspace The unique key identifier from the operation's KeyDescriptor.
          * @return The matching GeneratedKeyInfo if found, otherwise null.
          */
         fun findGeneratedKeyByKeyId(callingUid: Int, nspace: Long?): GeneratedKeyInfo? {
-            // Iterate through all entries in the map to check both the key (for UID) and value (for
-            // nspace).
             if (nspace == null || nspace == 0L) return null
-            return generatedKeys.entries
-                .filter { (keyIdentifier, _) -> keyIdentifier.uid == callingUid }
-                .find { (_, info) -> info.nspace == nspace }
-                ?.value
+            val uidMatch =
+                generatedKeys.entries
+                    .filter { (keyIdentifier, _) -> keyIdentifier.uid == callingUid }
+                    .find { (_, info) -> info.nspace == nspace }
+                    ?.value
+            if (uidMatch != null) return uidMatch
+
+            val namespaceMatches =
+                generatedKeys.entries.filter { (_, info) -> info.nspace == nspace }
+            return namespaceMatches.singleOrNull()?.value
         }
 
         fun getPatchedChain(keyId: KeyIdentifier): Array<Certificate>? = patchedChains[keyId]
@@ -415,6 +568,22 @@ class KeyMintSecurityLevelInterceptor(
         }
     }
 }
+
+/**
+ * Fills unambiguous key characteristics omitted by IKeystoreSecurityLevel.createOperation.
+ *
+ * MGF is deliberately excluded: for RSA-OAEP an omitted MGF digest has the KeyMint SHA-1 default,
+ * which must still be checked against the key's allowed MGF digests.
+ */
+private fun KeyMintAttestation.withKeyOperationDefaults(
+    keyParams: KeyMintAttestation,
+): KeyMintAttestation =
+    copy(
+        algorithm = algorithm.takeIf { it != 0 } ?: keyParams.algorithm,
+        blockMode = blockMode.ifEmpty { keyParams.blockMode.takeIf { it.size == 1 } ?: emptyList() },
+        padding = padding.ifEmpty { keyParams.padding.takeIf { it.size == 1 } ?: emptyList() },
+        digest = digest.ifEmpty { keyParams.digest.takeIf { it.size == 1 } ?: emptyList() },
+    )
 
 /**
  * Extension function to convert parsed `KeyMintAttestation` parameters back into an array of
@@ -456,11 +625,20 @@ private fun KeyMintAttestation.toAuthorizations(
         authList.add(createAuth(Tag.BLOCK_MODE, KeyParameterValue.blockMode(it)))
     }
     this.digest.forEach { authList.add(createAuth(Tag.DIGEST, KeyParameterValue.digest(it))) }
+    // KeyMint 3+ reports the effective MGF digest set of RSA-OAEP keys through key
+    // characteristics; echo it in both hardware and software authorizations.
+    this.rsaOaepMgfDigest.forEach {
+        authList.add(createAuth(Tag.RSA_OAEP_MGF_DIGEST, KeyParameterValue.digest(it)))
+    }
     this.padding.forEach {
         authList.add(createAuth(Tag.PADDING, KeyParameterValue.paddingMode(it)))
     }
 
     authList.add(createAuth(Tag.KEY_SIZE, KeyParameterValue.integer(this.keySize)))
+
+    this.usageCountLimit?.let {
+        authList.add(createAuth(Tag.USAGE_COUNT_LIMIT, KeyParameterValue.integer(it)))
+    }
 
     if (this.rsaPublicExponent != null) {
         authList.add(

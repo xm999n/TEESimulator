@@ -213,9 +213,28 @@ object AttestationBuilder {
             )
         }
 
+        // KeyMint 3+ surfaces the effective MGF digest set of RSA-OAEP keys in the attested
+        // authorization list (attestation extension tag 203).
+        if (params.rsaOaepMgfDigest.isNotEmpty()) {
+            list.add(
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_RSA_OAEP_MGF_DIGEST,
+                    DERSet(params.rsaOaepMgfDigest.map { ASN1Integer(it.toLong()) }.toTypedArray()),
+                )
+            )
+        }
+
+        // Only keys that genuinely require no user authentication carry the tag; auth-bound keys
+        // must not claim NO_AUTH_REQUIRED.
+        if (params.noAuthRequired == true) {
+            list.add(
+                DERTaggedObject(true, AttestationConstants.TAG_NO_AUTH_REQUIRED, DERNull.INSTANCE)
+            )
+        }
+
         list.addAll(
             listOf(
-                DERTaggedObject(true, AttestationConstants.TAG_NO_AUTH_REQUIRED, DERNull.INSTANCE),
                 DERTaggedObject(
                     true,
                     AttestationConstants.TAG_ORIGIN,
@@ -228,6 +247,17 @@ object AttestationBuilder {
                 ),
             )
         )
+
+        // Usage-count limited keys report the limit in the hardware-enforced list (tag 405).
+        params.usageCountLimit?.let {
+            list.add(
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_USAGE_COUNT_LIMIT,
+                    ASN1Integer(it.toLong()),
+                )
+            )
+        }
 
         // Use the same logic as getSimulatedHardwareProperties to conditionally add patch levels.
         val simulatedProperties = getSimulatedHardwareProperties(uid)

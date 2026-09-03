@@ -2,6 +2,7 @@ package org.matrix.TEESimulator.interception.keystore
 
 import android.os.Parcel
 import android.os.Parcelable
+import android.os.ServiceSpecificException
 import android.security.KeyStore
 import android.security.keystore.KeystoreResponse
 import org.matrix.TEESimulator.interception.core.BinderInterceptor
@@ -62,6 +63,19 @@ object InterceptorUtils {
                 writeNoException()
                 writeByteArray(data)
             }
+        return BinderInterceptor.TransactionResult.OverrideReply(parcel)
+    }
+
+    /**
+     * Creates an `OverrideReply` parcel carrying a `ServiceSpecificException`, the way keystore2
+     * surfaces KeyMint errors (e.g. INCOMPATIBLE_DIGEST) to binder clients.
+     */
+    fun createServiceSpecificExceptionReply(
+        code: Int,
+        message: String
+    ): BinderInterceptor.TransactionResult.OverrideReply {
+        val parcel =
+            Parcel.obtain().apply { writeException(ServiceSpecificException(code, message)) }
         return BinderInterceptor.TransactionResult.OverrideReply(parcel)
     }
 

@@ -7,6 +7,7 @@ import android.util.Pair
 import java.math.BigInteger
 import java.security.KeyPair
 import java.security.KeyPairGenerator
+import java.security.SecureRandom
 import java.security.cert.Certificate
 import java.security.interfaces.ECKey
 import java.security.interfaces.RSAKey
@@ -40,6 +41,32 @@ object CertificateGenerator {
     // AOSP utils.rs: pub const UNDEFINED_NOT_AFTER: i64 = 253402300799000i64;
     // RFC 5280 GeneralizedTime maximum: 9999-12-31T23:59:59 UTC (millis since epoch)
     private const val UNDEFINED_NOT_AFTER = 253402300799000L
+
+    private val secureRandom = SecureRandom()
+
+    /**
+     * Generates a software-based secret key (AES/HMAC). Symmetric keys never leave a certificate
+     * trail, so they can be fully emulated without touching the hardware backend.
+     *
+     * @param params The parameters specifying the key's algorithm and size.
+     * @return A new [SecretKey], or `null` on failure.
+     */
+    fun generateSoftwareSecretKey(params: KeyMintAttestation): javax.crypto.SecretKey? {
+        return runCatching {
+                val keySize = params.keySize.takeIf { it > 0 } ?: 256
+                val keyMaterial = ByteArray(keySize / 8).also(secureRandom::nextBytes)
+                when (params.algorithm) {
+                    Algorithm.AES -> javax.crypto.spec.SecretKeySpec(keyMaterial, "AES")
+                    Algorithm.HMAC -> javax.crypto.spec.SecretKeySpec(keyMaterial, "HMAC")
+                    else ->
+                        throw IllegalArgumentException(
+                            "Unsupported secret key algorithm: ${params.algorithm}"
+                        )
+                }
+            }
+            .onFailure { SystemLogger.error("Failed to generate software secret key.", it) }
+            .getOrNull()
+    }
 
     /**
      * Generates a software-based cryptographic key pair.
@@ -174,11 +201,12 @@ object CertificateGenerator {
         val keyId = KeyIdentifier(uid, attestKeyAlias)
         // Access the public map of generated keys
         val keyInfo = KeyMintSecurityLevelInterceptor.generatedKeys[keyId]
-        return if (keyInfo != null) {
+        val keyPair = keyInfo?.keyPair
+        return if (keyPair != null) {
             val certChain = CertificateHelper.getCertificateChain(keyInfo.response)
             if (!certChain.isNullOrEmpty()) {
                 val issuer = X509CertificateHolder(certChain[0].encoded).subject
-                Pair(keyInfo.keyPair, issuer)
+                Pair(keyPair, issuer)
             } else {
                 null
             }
